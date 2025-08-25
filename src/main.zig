@@ -9,23 +9,23 @@ pub fn main() !void {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
-    _ = args.skip(); // skip program name
+    _ = args.skip();
 
     var file: ?[]const u8 = null;
     var wordlist: ?[]const u8 = null;
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--file")) {
+        if (std.mem.eql(u8, arg, "-f")) {
             file = args.next() orelse return error.MissingFileArg;
-        } else if (std.mem.eql(u8, arg, "--wordlist")) {
+        } else if (std.mem.eql(u8, arg, "-wl")) {
             wordlist = args.next() orelse return error.MissingWordlistArg;
         } else if (std.mem.eql(u8, arg, "--help")) {
-            cout("Usage: n3ko --file <path> --wordlist <path>\n", .{});
+            cout("Usage: n3ko -f <path> -wl <path>\n", .{});
             return;
         }
     }
     if (file == null or wordlist == null) {
-        cout("Error: --file and --wordlist are required\n", .{});
+        cout("Error: -f and -wl are required\n", .{});
         return;
     }
 
