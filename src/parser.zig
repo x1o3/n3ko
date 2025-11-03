@@ -6,7 +6,6 @@ pub fn parseDictionary(
     dict_slice: []const u8,
     allocator: std.mem.Allocator,
 ) !std.StringHashMap([]const u8) {
-    // Create a mutable hash map on the stack
     var dict = std.StringHashMap([]const u8).init(allocator);
     var i: usize = 0;
     const len = dict_slice.len;
@@ -24,12 +23,13 @@ pub fn parseDictionary(
             
             // Parse value
             if (i < len and dict_slice[i] == '<' and i + 1 < len and dict_slice[i+1] != '<') {
-                // Hex string
-                const val_start = i + 1;
+                // Hex string - include the angle brackets in the value
+                const val_start = i;
+                i += 1; // Skip opening <
                 while (i < len and dict_slice[i] != '>') : (i += 1) {}
+                if (i < len) i += 1; // Include closing >
                 const value = dict_slice[val_start..i];
                 try dict.put(key, value);
-                i += 1;
             } else if (i < len and dict_slice[i] == '/') {
                 // Name
                 i += 1;

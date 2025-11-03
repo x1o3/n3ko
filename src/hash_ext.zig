@@ -19,18 +19,36 @@ pub const EncryptionDict = struct {
     }
 };
 
-/// Extract the /Encrypt dictionary from a PDF
-pub fn extractEncryptionDict(file_path: []const u8, allocator: std.mem.Allocator) !EncryptionDict {
+pub const ExtractionResult = struct {
+    enc_dict: EncryptionDict,
+    pdf_id: []const u8,
+};
+
+/// Extract encryption info and PDF ID
+pub fn extractEncryptionInfo(file_path: []const u8, allocator: std.mem.Allocator) !ExtractionResult {
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
     
     const stat = try file.stat();
     const size: usize = stat.size;
-    var buffer = try allocator.alloc(u8, size);
+    const buffer = try allocator.alloc(u8, size);
     defer allocator.free(buffer);
     _ = try file.readAll(buffer);
     
-    // 1. Find "trailer" and locate /Encrypt
+    // Extract encryption dictionary
+    const enc_dict = try extractEncryptionDictFromBuffer(buffer, allocator);
+    
+    // Extract PDF ID
+    const pdf_id = try extractPdfId(buffer, allocator);
+    
+    return ExtractionResult{
+        .enc_dict = enc_dict,
+        .pdf_id = pdf_id,
+    };
+}
+
+fn extractEncryptionDictFromBuffer(buffer: []const u8, allocator: std.mem.Allocator) !EncryptionDict {
+    // Find "trailer" and locate /Encrypt
     const trailer_pos = std.mem.indexOf(u8, buffer, "trailer") orelse return error.NoTrailer;
     const trailer_slice = buffer[trailer_pos .. @min(trailer_pos + 1024, buffer.len)];
     const enc_pos = std.mem.indexOf(u8, trailer_slice, "/Encrypt") orelse return error.NoEncrypt;
@@ -42,23 +60,23 @@ pub fn extractEncryptionDict(file_path: []const u8, allocator: std.mem.Allocator
     const obj_ref = trailer_slice[obj_start..i];
     const obj_num = try std.fmt.parseInt(u32, obj_ref, 10);
     
-    // 2. Find "obj" for that number
+    // Find "obj" for that number
     var obj_search_buf: [64]u8 = undefined;
     const obj_str = try std.fmt.bufPrint(&obj_search_buf, "{d} 0 obj", .{obj_num});
     const obj_pos = std.mem.indexOf(u8, buffer, obj_str) orelse return error.EncryptObjectNotFound;
     const endobj_pos = std.mem.indexOfPos(u8, buffer, obj_pos, "endobj") orelse return error.InvalidEncryptObject;
     const obj_slice = buffer[obj_pos .. endobj_pos];
     
-    // 3. Find dictionary inside << >>
+    // Find dictionary inside << >>
     const dict_start = std.mem.indexOf(u8, obj_slice, "<<") orelse return error.NoDict;
     const dict_end = std.mem.indexOfPos(u8, obj_slice, dict_start, ">>") orelse return error.NoDictEnd;
     const dict_slice = obj_slice[dict_start .. dict_end + 2];
     
-    // 4. Parse dictionary (now returns by value, not pointer)
+    // Parse dictionary
     var dict = try parser.parseDictionary(dict_slice, allocator);
     defer dict.deinit();
     
-    // 5. Collect fields and decode hex strings
+    // Collect fields and decode hex strings
     var result = EncryptionDict{};
     
     if (dict.get("O")) |o| {
@@ -82,13 +100,37 @@ pub fn extractEncryptionDict(file_path: []const u8, allocator: std.mem.Allocator
     
     return result;
 }
-/// handles the double-encoding issue
+
+/// Extract PDF ID from trailer
+fn extractPdfId(pdf_content: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    if (std.mem.indexOf(u8, pdf_content, "/ID")) |id_pos| {
+        const search_area = pdf_content[id_pos..@min(id_pos + 300, pdf_content.len)];
+        if (std.mem.indexOf(u8, search_area, "[<")) |bracket_pos| {
+            const start = id_pos + bracket_pos + 2;
+            if (std.mem.indexOfPos(u8, pdf_content, start, ">")) |end_pos| {
+                const hex_id = pdf_content[start..end_pos];
+                
+                if (hex_id.len % 2 == 0 and hex_id.len > 0) {
+                    var decoded = try allocator.alloc(u8, hex_id.len / 2);
+                    for (0..decoded.len) |i| {
+                        const hex_byte = hex_id[i * 2 .. i * 2 + 2];
+                        decoded[i] = std.fmt.parseInt(u8, hex_byte, 16) catch 0;
+                    }
+                    return decoded;
+                }
+            }
+        }
+    }
+    
+    return try allocator.alloc(u8, 0);
+}
+
+/// Decode hex string - handles <HEXDATA> format and double-encoding
 fn decodeValue(value: []const u8, allocator: std.mem.Allocator) ![]const u8 {
-    // Check if it's a hex string enclosed in < >
+    // Check if it's wrapped in angle brackets < >
     if (value.len > 2 and value[0] == '<' and value[value.len - 1] == '>') {
         const hex_content = value[1 .. value.len - 1];
         
-        // Ensure even length for proper hex decoding
         if (hex_content.len % 2 != 0) {
             return error.InvalidHexLength;
         }
@@ -101,7 +143,7 @@ fn decodeValue(value: []const u8, allocator: std.mem.Allocator) ![]const u8 {
         return decoded;
     }
     
-    // This handles cases where PDF stores "4445343838424243" instead of <4445343838424243>
+    // Check if it's raw hex (all hex characters, even length)
     if (value.len % 2 == 0 and value.len > 0) {
         var is_all_hex = true;
         for (value) |char| {
@@ -112,80 +154,20 @@ fn decodeValue(value: []const u8, allocator: std.mem.Allocator) ![]const u8 {
         }
         
         if (is_all_hex) {
-            // First decode the hex string to get another hex string
-            var first_decode = try allocator.alloc(u8, value.len / 2);
-            defer allocator.free(first_decode);
-            
-            for (0..first_decode.len) |i| {
+            var decoded = try allocator.alloc(u8, value.len / 2);
+            for (0..decoded.len) |i| {
                 const hex_byte = value[i * 2 .. i * 2 + 2];
-                first_decode[i] = try std.fmt.parseInt(u8, hex_byte, 16);
+                decoded[i] = try std.fmt.parseInt(u8, hex_byte, 16);
             }
-            
-            // Check if the result is still all hex characters (ASCII)
-            var is_still_hex = true;
-            for (first_decode) |char| {
-                if (!std.ascii.isHex(char)) {
-                    is_still_hex = false;
-                    break;
-                }
-            }
-            
-            if (is_still_hex and first_decode.len % 2 == 0) {
-                // Double-encoded! Decode again
-                var final_decode = try allocator.alloc(u8, first_decode.len / 2);
-                for (0..final_decode.len) |i| {
-                    const hex_byte = first_decode[i * 2 .. i * 2 + 2];
-                    final_decode[i] = try std.fmt.parseInt(u8, hex_byte, 16);
-                }
-                return final_decode;
-            } else {
-                // Single-encoded, return first decode
-                return try allocator.dupe(u8, first_decode);
-            }
+            return decoded;
         }
     }
+    
+    // Not hex, just duplicate as-is
     return try allocator.dupe(u8, value);
 }
 
-fn bytesToHex(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const hex_chars = "0123456789abcdef";
-    var result = try allocator.alloc(u8, bytes.len * 2);
-    
-    for (bytes, 0..) |byte, i| {
-        result[i * 2] = hex_chars[byte >> 4];
-        result[i * 2 + 1] = hex_chars[byte & 0x0f];
-    }
-    
-    return result;
-}
-/// extract the PDF ID from the trailer
-fn extractPdfId(pdf_content: []const u8, allocator: std.mem.Allocator) ![]const u8 {
-    // Look for /ID in trailer
-    if (std.mem.indexOf(u8, pdf_content, "/ID")) |id_pos| {
-        // Find the array [<hex1><hex2>] or [<hex>]
-        const search_area = pdf_content[id_pos..@min(id_pos + 300, pdf_content.len)];
-        if (std.mem.indexOf(u8, search_area, "[<")) |bracket_pos| {
-            const start = id_pos + bracket_pos + 2; // Skip "[<"
-            if (std.mem.indexOfPos(u8, pdf_content, start, ">")) |end_pos| {
-                const hex_id = pdf_content[start..end_pos];
-                
-                // Decode the hex ID
-                if (hex_id.len % 2 == 0 and hex_id.len > 0) {
-                    var decoded = try allocator.alloc(u8, hex_id.len / 2);
-                    for (0..decoded.len) |i| {
-                        const hex_byte = hex_id[i * 2 .. i * 2 + 2];
-                        decoded[i] = std.fmt.parseInt(u8, hex_byte, 16) catch 0;
-                    }
-                    return decoded;
-                }
-            }
-        }
-    }
-    return try allocator.alloc(u8, 0);
-}
-
-/// PDF ID extraction
-pub fn formatForHashcat(enc_dict: *const EncryptionDict, pdf_content: []const u8, allocator: std.mem.Allocator) ![]u8 {
+pub fn formatForHashcat(enc_dict: *const EncryptionDict, pdf_id: []const u8, allocator: std.mem.Allocator) ![]u8 {
     if (enc_dict.U == null or enc_dict.O == null) {
         return error.InsufficientData;
     }
@@ -195,11 +177,6 @@ pub fn formatForHashcat(enc_dict: *const EncryptionDict, pdf_content: []const u8
     const p = if (enc_dict.P) |p_str| std.fmt.parseInt(i32, p_str, 10) catch -4 else -4;
     const length = if (enc_dict.Length) |l_str| std.fmt.parseInt(u32, l_str, 10) catch 128 else 128;
     
-    // Extract PDF ID
-    const pdf_id = try extractPdfId(pdf_content, allocator);
-    defer allocator.free(pdf_id);
-    
-    // Convert binary data to hex strings
     const u_hex = try bytesToHex(enc_dict.U.?, allocator);
     defer allocator.free(u_hex);
     const o_hex = try bytesToHex(enc_dict.O.?, allocator);
@@ -207,23 +184,29 @@ pub fn formatForHashcat(enc_dict: *const EncryptionDict, pdf_content: []const u8
     const id_hex = try bytesToHex(pdf_id, allocator);
     defer allocator.free(id_hex);
     
-    // Format: $pdf$V*R*keylen*P*id_len*id*U_len*U*O_len*O
+    // Include metadata encryption flag (1 = not encrypted, 0 = encrypted)
+    // Default to 1 for R < 4
+    const metadata_encrypted: u32 = 1;
+    
     const hash_line = try std.fmt.allocPrint(
         allocator,
-        "$pdf${d}*{d}*{d}*{d}*{d}*{s}*{d}*{s}*{d}*{s}",
+        "$pdf${d}*{d}*{d}*{d}*{d}*{d}*{s}*{d}*{s}*{d}*{s}",
         .{ 
-            v,                    // Version (2)
-            r,                    // Revision (3) 
-            length,               // Key length (128)
-            p,                    // Permissions (-4)
-            pdf_id.len,           // ID length
-            id_hex,               // ID as hex
-            enc_dict.U.?.len,     // U length 
-            u_hex,                // U value as hex
-            enc_dict.O.?.len,     // O length  
-            o_hex                 // O value as hex
+            v, r, length, p,
+            metadata_encrypted,
+            pdf_id.len, id_hex,
+            enc_dict.U.?.len, u_hex,
+            enc_dict.O.?.len, o_hex
         }
     );
     
     return hash_line;
+}
+
+fn bytesToHex(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    var hex = try allocator.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, i| {
+        _ = try std.fmt.bufPrint(hex[i * 2 .. i * 2 + 2], "{x:0>2}", .{byte});
+    }
+    return hex;
 }
