@@ -56,14 +56,6 @@ pub const PdfCracker = struct {
             );
             defer self.allocator.free(computed_hash);
             
-            // Debug: Print each password and its hash
-            std.debug.print("[{d}] Testing: '{s}'\n", .{attempts, password});
-            std.debug.print("    Computed: ", .{});
-            printHex(computed_hash[0..16]);
-            std.debug.print("\n    Expected: ", .{});
-            printHex(enc_dict.U.?[0..16]);
-            std.debug.print("\n", .{});
-            
             // Compare with target hash (user password hash)
             // For R=3, we compare first 16 bytes
             const r = if (enc_dict.R) |r_str| try std.fmt.parseInt(u32, r_str, 10) else 3;
@@ -72,6 +64,9 @@ pub const PdfCracker = struct {
             if (std.mem.eql(u8, computed_hash[0..compare_len], enc_dict.U.?[0..compare_len])) {
                 std.debug.print("\n\n[+] PASSWORD FOUND: {s}\n", .{password});
                 std.debug.print("[+] Attempts: {d}\n", .{attempts});
+                const end_time = std.time.nanoTimestamp();
+                const total_time = @as(f64, @floatFromInt(end_time - start_time)) / 1_000_000_000.0;
+                std.debug.print("[+] Time taken: {d:.2} seconds\n", .{ total_time });
                 return try self.allocator.dupe(u8, password);
             }
         }
