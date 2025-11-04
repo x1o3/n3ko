@@ -1,13 +1,16 @@
 # Kaam
 
 ## Rabjot
-- [ ] AI
+- [ ] GTK Libs
 
 ## Jatin
 - [x] Parser
-    - [ ] cli
-    - [ ] dict
+    - [x] cli
+    - [x] dict
 - [x] Hash extraction
+- [x] Hash Matching
+- [x] Password cracking
+- [ ] Multi-Threading
 
 ## Karttikeya
 - [ ] Documentation
