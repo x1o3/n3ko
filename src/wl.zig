@@ -97,7 +97,11 @@ pub const PdfCracker = struct {
                 .attempts = &total_attempts,
             };
 
-            thread.* = try std.Thread.spawn(.{}, workerThread, .{ context });
+            thread.* = std.Thread.spawn(.{}, workerThread, .{ context }) catch {
+                // If spawn fails, clean up this context and propagate error
+                self.allocator.destroy(context);
+                return error.ThreadSpawnFailed;
+            };
         }
 
         // Progress monitor thread
@@ -128,10 +132,15 @@ pub const PdfCracker = struct {
             std.debug.print("\n\n[+] PASSWORD FOUND: {s}\n", .{password_slice});
             std.debug.print("[+] Attempts: {d}\n", .{attempts});
             std.debug.print("[+] Time taken: {d:.2} seconds\n", .{total_time});
-            std.debug.print("[+] Speed: {d:.2} passwords/sec\n",
-                .{ @as(f64, @floatFromInt(attempts)) / total_time });
+            std.debug.print(
+                "[+] Speed: {d:.2} passwords/sec\n",
+                .{ @as(f64, @floatFromInt(attempts)) / total_time },
+            );
 
-            return try self.allocator.dupe(u8, password_slice);
+            // Take ownership: make our own copy, then free the worker’s copy
+            const result = try self.allocator.dupe(u8, password_slice);
+            self.allocator.free(password_slice);
+            return result;
         }
 
         std.debug.print("\n\n[-] Password not found in wordlist\n", .{});
@@ -174,131 +183,138 @@ pub const PdfCracker = struct {
 
         return passwords.toOwnedSlice();
     }
+};
 
-    /// Compute PDF password hash (Algorithm 3.2 + 3.4/3.5 from PDF specification)
-    fn computePdfHash(
-        self: *PdfCracker,
-        password: []const u8,
-        enc_dict: *const hash_ext.EncryptionDict,
-        pdf_id: []const u8,
-    ) ![]u8 {
-        const r = if (enc_dict.R) |r_str|
-            try std.fmt.parseInt(u32, r_str, 10)
-        else
-            3;
-        const p = if (enc_dict.P) |p_str|
-            try std.fmt.parseInt(i32, p_str, 10)
-        else
-            -4;
-        const key_len_bits = if (enc_dict.Length) |l_str|
-            try std.fmt.parseInt(u32, l_str, 10)
-        else
-            40;
-        const key_len = key_len_bits / 8;
+/// Compute PDF password hash (Algorithm 3.2 + 3.4/3.5 from PDF specification)
+/// Writes 32 bytes into `out` (for both R=2 and R>=3).
+fn computePdfHashInto(
+    password: []const u8,
+    r: u32,
+    p: i32,
+    key_len: usize,
+    enc_dict: *const hash_ext.EncryptionDict,
+    pdf_id: []const u8,
+    out: *[32]u8,
+) void {
+    // PDF password padding string
+    const padding = [_]u8{
+        0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41,
+        0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
+        0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80,
+        0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
+    };
 
-        // PDF password padding string
-        const padding = [_]u8{
-            0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41,
-            0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
-            0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80,
-            0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
-        };
+    // Step 1: Pad or truncate password to 32 bytes
+    var padded_password: [32]u8 = undefined;
+    const copy_len = @min(password.len, 32);
+    @memcpy(padded_password[0..copy_len], password[0..copy_len]);
+    if (copy_len < 32) {
+        @memcpy(padded_password[copy_len..], padding[0 .. 32 - copy_len]);
+    }
 
-        // Step 1: Pad or truncate password to 32 bytes
-        var padded_password: [32]u8 = undefined;
-        const copy_len = @min(password.len, 32);
-        @memcpy(padded_password[0..copy_len], password[0..copy_len]);
-        if (copy_len < 32) {
-            @memcpy(padded_password[copy_len..], padding[0 .. 32 - copy_len]);
-        }
+    // Step 2: Initialize MD5 hash with padded password
+    var hasher = std.crypto.hash.Md5.init(.{});
+    hasher.update(&padded_password);
 
-        // Step 2: Initialize MD5 hash with padded password
-        var hasher = std.crypto.hash.Md5.init(.{});
-        hasher.update(&padded_password);
+    // Step 3: Pass owner password hash (O entry)
+    if (enc_dict.O) |o_value| {
+        hasher.update(o_value);
+    }
 
-        // Step 3: Pass owner password hash (O entry)
-        if (enc_dict.O) |o_value| {
-            hasher.update(o_value);
-        }
+    // Step 4: Pass permissions as 4-byte little-endian integer
+    var p_bytes: [4]u8 = undefined;
+    std.mem.writeInt(i32, &p_bytes, p, .little);
+    hasher.update(&p_bytes);
 
-        // Step 4: Pass permissions as 4-byte little-endian integer
-        var p_bytes: [4]u8 = undefined;
-        std.mem.writeInt(i32, &p_bytes, p, .little);
-        hasher.update(&p_bytes);
+    // Step 5: Pass PDF file identifier
+    hasher.update(pdf_id);
 
-        // Step 5: Pass PDF file identifier
-        hasher.update(pdf_id);
+    // Step 6: For R >= 4, additional step (not encrypting metadata)
+    if (r >= 4) {
+        const extra = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
+        hasher.update(&extra);
+    }
 
-        // Step 6: For R >= 4, additional step (not encrypting metadata)
-        if (r >= 4) {
-            const extra = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
-            hasher.update(&extra);
-        }
+    // Step 7: Finish the hash
+    var hash: [16]u8 = undefined;
+    hasher.final(&hash);
 
-        // Step 7: Finish the hash
-        var hash: [16]u8 = undefined;
-        hasher.final(&hash);
-
-        // Step 8: For R >= 3, do 50 iterations of MD5 on the key
-        if (r >= 3) {
-            var i: usize = 0;
-            while (i < 50) : (i += 1) {
-                var round_hasher = std.crypto.hash.Md5.init(.{});
-                round_hasher.update(hash[0..key_len]);
-                round_hasher.final(&hash);
-            }
-        }
-
-        const encryption_key = hash[0..key_len];
-
-        // Algorithm 3.4/3.5: Computing the user password (U)
-        if (r == 2) {
-            // Algorithm 3.4 (R=2): Encrypt padding string with RC4
-            const result = try self.allocator.alloc(u8, 32);
-            @memcpy(result, &padding);
-            rc4Encrypt(result, encryption_key);
-            return result;
-        } else {
-            // Algorithm 3.5 (R>=3)
-            // Step a: Create hash of padding + PDF ID
-            var u_hasher = std.crypto.hash.Md5.init(.{});
-            u_hasher.update(&padding);
-            u_hasher.update(pdf_id);
-            var u_hash: [16]u8 = undefined;
-            u_hasher.final(&u_hash);
-
-            // Step b: Encrypt the hash with RC4 using encryption key
-            var encrypted: [16]u8 = undefined;
-            @memcpy(&encrypted, &u_hash);
-            rc4Encrypt(&encrypted, encryption_key);
-
-            // Step c: Do 19 more iterations with modified keys
-            var iteration: usize = 1;
-            while (iteration <= 19) : (iteration += 1) {
-                var modified_key: [16]u8 = undefined;
-                for (encryption_key, 0..) |byte, i| {
-                    modified_key[i] = byte ^ @as(u8, @intCast(iteration));
-                }
-                rc4Encrypt(&encrypted, modified_key[0..key_len]);
-            }
-
-            // Step d: Pad result to 32 bytes
-            const result = try self.allocator.alloc(u8, 32);
-            @memcpy(result[0..16], &encrypted);
-            @memcpy(result[16..32], padding[16..32]);
-            return result;
+    // Step 8: For R >= 3, do 50 iterations of MD5 on the key
+    if (r >= 3) {
+        var i: usize = 0;
+        while (i < 50) : (i += 1) {
+            var round_hasher = std.crypto.hash.Md5.init(.{});
+            round_hasher.update(hash[0..key_len]);
+            round_hasher.final(&hash);
         }
     }
-};
+
+    const encryption_key = hash[0..key_len];
+
+    // Algorithm 3.4/3.5: Computing the user password (U)
+    if (r == 2) {
+        // Algorithm 3.4 (R=2): Encrypt padding string with RC4
+        @memcpy(out, &padding);
+        rc4Encrypt(out[0..32], encryption_key);
+    } else {
+        // Algorithm 3.5 (R>=3)
+        // Step a: Create hash of padding + PDF ID
+        var u_hasher = std.crypto.hash.Md5.init(.{});
+        u_hasher.update(&padding);
+        u_hasher.update(pdf_id);
+        var u_hash: [16]u8 = undefined;
+        u_hasher.final(&u_hash);
+
+        // Step b: Encrypt the hash with RC4 using encryption key
+        var encrypted: [16]u8 = undefined;
+        @memcpy(&encrypted, &u_hash);
+        rc4Encrypt(&encrypted, encryption_key);
+
+        // Step c: Do 19 more iterations with modified keys
+        var iteration: usize = 1;
+        while (iteration <= 19) : (iteration += 1) {
+            var modified_key: [16]u8 = undefined;
+            for (encryption_key, 0..) |byte, i| {
+                modified_key[i] = byte ^ @as(u8, @intCast(iteration));
+            }
+            rc4Encrypt(&encrypted, modified_key[0..key_len]);
+        }
+
+        // Step d: Pad result to 32 bytes
+        @memcpy(out[0..16], &encrypted);
+        @memcpy(out[16..32], padding[16..32]);
+    }
+}
 
 fn workerThread(context: *ThreadContext) void {
     defer context.allocator.destroy(context);
 
-    const r = if (context.enc_dict.R) |r_str|
-        std.fmt.parseInt(u32, r_str, 10) catch 3
-    else
-        3;
-    const compare_len: usize = if (r >= 3) 16 else 32;
+    // Pre-parse R, P, Length once per thread (instead of per-password)
+    const r_value: u32 = blk: {
+        if (context.enc_dict.R) |r_str| {
+            break :blk std.fmt.parseInt(u32, r_str, 10) catch 3;
+        } else break :blk 3;
+    };
+
+    const p_value: i32 = blk: {
+        if (context.enc_dict.P) |p_str| {
+            break :blk std.fmt.parseInt(i32, p_str, 10) catch -4;
+        } else break :blk -4;
+    };
+
+    const key_len_bits_raw: u32 = blk: {
+        if (context.enc_dict.Length) |l_str| {
+            break :blk std.fmt.parseInt(u32, l_str, 10) catch 40;
+        } else break :blk 40;
+    };
+
+    // Clamp to 128 bits max (spec for R=3/4)
+    const key_len_bits = @min(key_len_bits_raw, 128);
+    const key_len = @as(usize, @intCast(key_len_bits / 8));
+
+    const compare_len: usize = if (r_value >= 3) 16 else 32;
+
+    var hash_buf: [32]u8 = undefined;
 
     for (context.passwords) |password| {
         // Check if another thread found the password
@@ -306,18 +322,23 @@ fn workerThread(context: *ThreadContext) void {
             break;
         }
 
-        var cracker = PdfCracker.init(context.allocator);
-        const computed_hash = cracker.computePdfHash(
+        // Compute hash into stack buffer
+        computePdfHashInto(
             password,
+            r_value,
+            p_value,
+            key_len,
             context.enc_dict,
             context.pdf_id,
-        ) catch continue;
-        defer context.allocator.free(computed_hash);
+            &hash_buf,
+        );
 
         _ = context.attempts.fetchAdd(1, .monotonic);
 
         if (context.enc_dict.U) |u_val| {
-            if (std.mem.eql(u8, computed_hash[0..compare_len], u_val[0..compare_len])) {
+            if (u_val.len < compare_len) continue;
+
+            if (std.mem.eql(u8, hash_buf[0..compare_len], u_val[0..compare_len])) {
                 const password_copy = context.allocator.dupe(u8, password) catch continue;
                 context.result_len.store(password_copy.len, .release);
                 context.result_ptr.store(password_copy.ptr, .release);
