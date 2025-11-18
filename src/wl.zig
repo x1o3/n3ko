@@ -12,13 +12,9 @@ const ThreadContext = struct {
     enc_dict: *const hash_ext.EncryptionDict,
     pdf_id: []const u8,
     passwords: [][]const u8,
-    // Shared atomic pointer to found password
     result_ptr: *std.atomic.Value(?[*]const u8),
-    // Shared length of found password
     result_len: *std.atomic.Value(usize),
-    // Shared attempts counter
     attempts: *std.atomic.Value(usize),
-    // Cancel flag
     cancel_ptr: *std.atomic.Value(bool),
 };
 
