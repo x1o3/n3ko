@@ -46,7 +46,7 @@ pub fn main() !void {
     }
     
     cout("╔══════════════════════════════════════════════════════════╗\n", .{});
-    cout("║                   n3ko Password Cracker                 ║\n", .{});
+    cout("║                   n3ko Password Cracker                  ║\n", .{});
     cout("╚══════════════════════════════════════════════════════════╝\n\n", .{});
     cout("[*] Target file: {s}\n", .{file.?});
     cout("[*] Wordlist: {s}\n", .{wordlist.?});

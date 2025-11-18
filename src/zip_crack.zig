@@ -156,7 +156,7 @@ pub const ZipCracker = struct {
         num_threads: usize,
     ) !?[]const u8 {
         std.debug.print("\n╔══════════════════════════════════════════════════════════╗\n", .{});
-        std.debug.print("║          ZIP PASSWORD CRACKER                           ║\n", .{});
+        std.debug.print("║          ZIP PASSWORD CRACKER                            ║\n", .{});
         std.debug.print("╚══════════════════════════════════════════════════════════╝\n\n", .{});
 
         std.debug.print("[*] Target File: {s}\n", .{zip_info.filename});
@@ -309,6 +309,10 @@ pub const ZipCracker = struct {
         const file = try std.fs.cwd().openFile(wordlist_path, .{});
         defer file.close();
 
+        // Get file size for progress
+        const file_stat = try file.stat();
+        const file_size = file_stat.size;
+
         var passwords = std.ArrayList([]const u8).init(self.allocator);
         errdefer {
             for (passwords.items) |pwd| {
@@ -321,12 +325,25 @@ pub const ZipCracker = struct {
         var reader = buf_reader.reader();
 
         var line_buf: [1024]u8 = undefined;
+        var bytes_read: usize = 0;
+        var last_progress: f64 = 0.0;
+
         while (try reader.readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
             const password = std.mem.trim(u8, line, " \t\r\n");
+            bytes_read += line.len + 1; // +1 for newline
+            
             if (password.len == 0) continue;
             try passwords.append(try self.allocator.dupe(u8, password));
+
+            // Update progress every 5%
+            const progress = (@as(f64, @floatFromInt(bytes_read)) / @as(f64, @floatFromInt(file_size))) * 100.0;
+            if (progress - last_progress >= 5.0) {
+                std.debug.print("\r[*] Loading wordlist: {d:.0}%     ", .{progress});
+                last_progress = progress;
+            }
         }
 
+        std.debug.print("\r[*] Loading wordlist: 100%     \n", .{});
         return passwords.toOwnedSlice();
     }
 
@@ -477,4 +494,3 @@ fn printHex(data: []const u8) void {
         std.debug.print("{x:0>2}", .{byte});
     }
 }
-
