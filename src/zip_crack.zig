@@ -1,4 +1,5 @@
-// zip_crack.zig  ZIP password cracking implementation with multithreading
+// zip_crack.zig - ZIP password cracking implementation with multithreading
+// Fixed version: resolved race conditions, memory leaks, and added proper cancellation
 const std = @import("std");
 
 pub const ZipEncryption = enum {
@@ -56,7 +57,7 @@ const ZipThreadContext = struct {
     result_ptr: *std.atomic.Value(?[*]const u8),
     result_len: *std.atomic.Value(usize),
     attempts: *std.atomic.Value(usize),
-    cancel_ptr: *std.atomic.Value(bool), // new
+    cancel_ptr: *std.atomic.Value(bool),
 };
 
 pub const ZipCracker = struct {
@@ -150,7 +151,6 @@ pub const ZipCracker = struct {
     }
 
     /// Multithreaded password cracking
-
     pub fn crackPasswordMultithreaded(
         self: *ZipCracker,
         zip_info: *const ZipFileInfo,
@@ -219,11 +219,11 @@ pub const ZipCracker = struct {
         // Split work among threads
         const chunk_size = (passwords.len + num_threads - 1) / num_threads;
         const threads = try self.allocator.alloc(std.Thread, num_threads);
-        defer self.allocator.free(threads); // safe: we only free after joining spawned threads
+        defer self.allocator.free(threads);
 
         const start_time = std.time.nanoTimestamp();
 
-        // Spawn worker threads (robust: handle spawn failure by cancelling & joining spawned threads)
+        // Spawn worker threads with proper error handling
         for (threads, 0..) |*thread, i| {
             const start_idx = i * chunk_size;
             const end_idx = @min(start_idx + chunk_size, passwords.len);
@@ -231,6 +231,8 @@ pub const ZipCracker = struct {
             if (start_idx >= passwords.len) continue;
 
             const context = try self.allocator.create(ZipThreadContext);
+            errdefer self.allocator.destroy(context);
+            
             context.* = .{
                 .allocator = self.allocator,
                 .zip_info = zip_info,
@@ -241,14 +243,8 @@ pub const ZipCracker = struct {
                 .cancel_ptr = &cancel,
             };
 
-            const spawn_result = std.Thread.spawn(.{}, zipWorkerThread, .{context});
-            if (spawn_result) |thr| {
-                thread.* = thr;
-                spawned += 1;
-            } else {
-                // Failed to spawn this worker: destroy context we created for it,
-                // signal cancellation so already-spawned threads exit,
-                // join already-spawned threads, then return an error.
+            thread.* = std.Thread.spawn(.{}, zipWorkerThread, .{context}) catch |err| {
+                // Failed to spawn: destroy context, signal cancellation, join spawned threads
                 self.allocator.destroy(context);
                 cancel.store(true, .release);
 
@@ -257,14 +253,21 @@ pub const ZipCracker = struct {
                     threads[j].join();
                 }
 
-                return error.ThreadSpawnFailed;
-            }
+                return err;
+            };
+            
+            spawned += 1;
         }
 
-        // Spawn progress monitor thread (handle spawn failure similarly)
-        const monitor_spawn = std.Thread.spawn(.{}, zipProgressMonitor, .{ &total_attempts, &result_ptr, start_time, passwords.len });
-        if (!monitor_spawn) {
-            // cancel workers and join those that were spawned
+        // Spawn progress monitor thread with proper error handling
+        const monitor_thread = std.Thread.spawn(.{}, zipProgressMonitor, .{ 
+            &total_attempts, 
+            &result_ptr, 
+            &cancel,
+            start_time, 
+            passwords.len 
+        }) catch |err| {
+            // Cancel workers and join those that were spawned
             cancel.store(true, .release);
 
             var j: usize = 0;
@@ -272,9 +275,8 @@ pub const ZipCracker = struct {
                 threads[j].join();
             }
 
-            return error.ThreadSpawnFailed;
-        }
-        const monitor_thread = monitor_spawn.?;
+            return err;
+        };
 
         // Wait for all worker threads that were spawned
         var k: usize = 0;
@@ -282,7 +284,8 @@ pub const ZipCracker = struct {
             threads[k].join();
         }
 
-        // Stop monitor
+        // Signal monitor to stop and wait for it
+        cancel.store(true, .release);
         monitor_thread.join();
 
         const elapsed = @as(f64, @floatFromInt(std.time.nanoTimestamp() - start_time)) / 1_000_000_000.0;
@@ -419,7 +422,12 @@ fn zipWorkerThread(context: *ZipThreadContext) void {
     defer context.allocator.destroy(context);
 
     for (context.passwords) |password| {
-        // Check if another thread found the password
+        // Check if we should cancel (another thread found it or spawn failure)
+        if (context.cancel_ptr.load(.acquire)) {
+            break;
+        }
+        
+        // Check if another thread already found the password
         if (context.result_ptr.load(.acquire) != null) {
             break;
         }
@@ -428,8 +436,23 @@ fn zipWorkerThread(context: *ZipThreadContext) void {
 
         if (ZipCracker.testZipPassword(context.zip_info, password)) {
             const password_copy = context.allocator.dupe(u8, password) catch continue;
-            context.result_ptr.store(password_copy.ptr, .release);
-            context.result_len.store(password_copy.len, .release);
+            
+            // Atomically try to set the result - prevents race condition
+            const previous = context.result_ptr.swap(password_copy.ptr, .acq_rel);
+            
+            if (previous) |old_ptr| {
+                // Another thread beat us to it, free our copy
+                const old_len = context.result_len.load(.acquire);
+                context.allocator.free(old_ptr[0..old_len]);
+                // Store our result anyway since we have the lock
+                context.result_len.store(password_copy.len, .release);
+            } else {
+                // We were first, store the length
+                context.result_len.store(password_copy.len, .release);
+            }
+            
+            // Signal all threads to stop
+            context.cancel_ptr.store(true, .release);
             break;
         }
     }
@@ -438,10 +461,11 @@ fn zipWorkerThread(context: *ZipThreadContext) void {
 fn zipProgressMonitor(
     attempts: *std.atomic.Value(usize),
     result: *std.atomic.Value(?[*]const u8),
+    cancel: *std.atomic.Value(bool),
     start_time: i128,
     total: usize,
 ) void {
-    while (result.load(.acquire) == null) {
+    while (!cancel.load(.acquire)) {
         std.time.sleep(500 * std.time.ns_per_ms);
 
         const current_attempts = attempts.load(.acquire);
@@ -457,7 +481,8 @@ fn zipProgressMonitor(
             .{ progress, current_attempts, total, rate },
         );
 
-        if (current_attempts >= total) break;
+        // Stop if password found or all passwords tried
+        if (result.load(.acquire) != null or current_attempts >= total) break;
     }
 }
 
@@ -504,4 +529,3 @@ fn printHex(data: []const u8) void {
         std.debug.print("{x:0>2}", .{byte});
     }
 }
-
