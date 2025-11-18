@@ -437,22 +437,24 @@ fn zipWorkerThread(context: *ZipThreadContext) void {
         if (ZipCracker.testZipPassword(context.zip_info, password)) {
             const password_copy = context.allocator.dupe(u8, password) catch continue;
             
-            // Atomically try to set the result - prevents race condition
-            const previous = context.result_ptr.swap(password_copy.ptr, .acq_rel);
+            // Try to atomically set the result - only succeeds if null
+            const exchange_result = context.result_ptr.cmpxchgStrong(
+                null,
+                password_copy.ptr,
+                .acq_rel,
+                .acquire,
+            );
             
-            if (previous) |old_ptr| {
-                // Another thread beat us to it, free our copy
-                const old_len = context.result_len.load(.acquire);
-                context.allocator.free(old_ptr[0..old_len]);
-                // Store our result anyway since we have the lock
-                context.result_len.store(password_copy.len, .release);
+            if (exchange_result) |_| {
+                // Another thread already set it, free our copy
+                context.allocator.free(password_copy);
             } else {
-                // We were first, store the length
+                // We were first! Store the length
                 context.result_len.store(password_copy.len, .release);
+                // Signal all threads to stop
+                context.cancel_ptr.store(true, .release);
             }
             
-            // Signal all threads to stop
-            context.cancel_ptr.store(true, .release);
             break;
         }
     }
