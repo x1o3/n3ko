@@ -1,4 +1,4 @@
-// zip_crack.zig - ZIP password cracking implementation with multithreading
+// zip_crack.zig  ZIP password cracking implementation with multithreading
 const std = @import("std");
 
 pub const ZipEncryption = enum {
