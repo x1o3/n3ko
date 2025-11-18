@@ -56,6 +56,7 @@ const ZipThreadContext = struct {
     result_ptr: *std.atomic.Value(?[*]const u8),
     result_len: *std.atomic.Value(usize),
     attempts: *std.atomic.Value(usize),
+    cancel_ptr: *std.atomic.Value(bool), // new
 };
 
 pub const ZipCracker = struct {
@@ -149,6 +150,7 @@ pub const ZipCracker = struct {
     }
 
     /// Multithreaded password cracking
+
     pub fn crackPasswordMultithreaded(
         self: *ZipCracker,
         zip_info: *const ZipFileInfo,
@@ -170,6 +172,9 @@ pub const ZipCracker = struct {
             .{ zip_info.flags, if (zip_info.has_data_descriptor) "yes" else "no" });
         std.debug.print("[*] Hashcat Mode: {d}\n", .{zip_info.encryption_method.getHashcatMode()});
         std.debug.print("[*] Threads: {d}\n", .{num_threads});
+
+        var cancel = std.atomic.Value(bool).init(false);
+        var spawned: usize = 0;
 
         if (zip_info.encryption_method != .ZipCrypto) {
             std.debug.print("\n[!] WARNING: Only ZipCrypto is currently supported\n", .{});
@@ -214,11 +219,11 @@ pub const ZipCracker = struct {
         // Split work among threads
         const chunk_size = (passwords.len + num_threads - 1) / num_threads;
         const threads = try self.allocator.alloc(std.Thread, num_threads);
-        defer self.allocator.free(threads);
+        defer self.allocator.free(threads); // safe: we only free after joining spawned threads
 
         const start_time = std.time.nanoTimestamp();
 
-        // Spawn worker threads
+        // Spawn worker threads (robust: handle spawn failure by cancelling & joining spawned threads)
         for (threads, 0..) |*thread, i| {
             const start_idx = i * chunk_size;
             const end_idx = @min(start_idx + chunk_size, passwords.len);
@@ -233,26 +238,48 @@ pub const ZipCracker = struct {
                 .result_ptr = &result_ptr,
                 .result_len = &result_len,
                 .attempts = &total_attempts,
+                .cancel_ptr = &cancel,
             };
 
-            thread.* = std.Thread.spawn(.{}, zipWorkerThread, .{ context }) catch {
+            const spawn_result = std.Thread.spawn(.{}, zipWorkerThread, .{context});
+            if (spawn_result) |thr| {
+                thread.* = thr;
+                spawned += 1;
+            } else {
+                // Failed to spawn this worker: destroy context we created for it,
+                // signal cancellation so already-spawned threads exit,
+                // join already-spawned threads, then return an error.
                 self.allocator.destroy(context);
+                cancel.store(true, .release);
+
+                var j: usize = 0;
+                while (j < spawned) : (j += 1) {
+                    threads[j].join();
+                }
+
                 return error.ThreadSpawnFailed;
-            };
+            }
         }
 
-        // Progress monitor thread
-        const monitor_thread = try std.Thread.spawn(
-            .{},
-            zipProgressMonitor,
-            .{ &total_attempts, &result_ptr, start_time, passwords.len },
-        );
+        // Spawn progress monitor thread (handle spawn failure similarly)
+        const monitor_spawn = std.Thread.spawn(.{}, zipProgressMonitor, .{ &total_attempts, &result_ptr, start_time, passwords.len });
+        if (!monitor_spawn) {
+            // cancel workers and join those that were spawned
+            cancel.store(true, .release);
 
-        // Wait for all worker threads
-        for (threads, 0..) |thread, i| {
-            const start_idx = i * chunk_size;
-            if (start_idx >= passwords.len) continue;
-            thread.join();
+            var j: usize = 0;
+            while (j < spawned) : (j += 1) {
+                threads[j].join();
+            }
+
+            return error.ThreadSpawnFailed;
+        }
+        const monitor_thread = monitor_spawn.?;
+
+        // Wait for all worker threads that were spawned
+        var k: usize = 0;
+        while (k < spawned) : (k += 1) {
+            threads[k].join();
         }
 
         // Stop monitor
